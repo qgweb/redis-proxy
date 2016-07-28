@@ -116,18 +116,14 @@ func handle(conn net.Conn) {
 		pconn.Flush()
 
 		resp, err = rproxy.Parse(pconn.BufioReader())
-		if err != nil && err.Error() == io.EOF.Error() {
-			pmux.RUnlock()
-			log.Error(err)
-			conn.Close()
-			break
-		}
 		if err != nil {
+			pconnhash[host].PutConn(pconn)
 			pmux.RUnlock()
 			log.Error(err)
 			conn.Close()
 			break
 		}
+
 		resp.WriteTo(conn)
 		pconnhash[host].PutConn(pconn)
 		pmux.RUnlock()
@@ -137,12 +133,12 @@ func handle(conn net.Conn) {
 
 func main() {
 	go func() {
-		t := time.NewTicker(time.Second * 2)
+		t := time.NewTicker(time.Second * 10)
 		for {
 			select {
 			case <-t.C:
 				initPoolHash()
-				log.Info(serverhost,len(pconnhash))
+				log.Info(serverhost, len(pconnhash))
 			}
 		}
 	}()
