@@ -5,29 +5,67 @@ import (
 	"github.com/ngaut/log"
 	"github.com/qgweb/redis-proxy"
 	"stathat.com/c/consistent"
+	"github.com/astaxie/beego/httplib"
 	"bufio"
 	"io"
+	"flag"
+	"sync"
+	"strings"
+	"time"
 )
 
 var (
 	pool *rproxy.Pool
 	phash *consistent.Consistent
 	pconnhash map[string]*rproxy.Pool
+
+	confserver = flag.String("cserver", "http://127.0.0.1:13457", "配置服务器地址")
+	phost = flag.String("host", "127.0.0.1", "监听地址")
+	pport = flag.String("port", "13345", "监听端口")
+	serverhost []string
+	mux sync.RWMutex
+	pmux sync.RWMutex
 )
 
 func init() {
-	phash = consistent.New()
-	pconnhash = make(map[string]*rproxy.Pool)
-	phash.NumberOfReplicas = 20
-	phash.Add("127.0.0.1:6379")
-	phash.Add("127.0.0.1:6380")
+	flag.Parse()
+	mux = sync.RWMutex{}
+	pmux = sync.RWMutex{}
+	serverhost = make([]string, 0)
+	if len(getConfServer()) == 0 {
+		log.Fatal("配置服务器请求失败！！")
+	}
+	initPoolHash()
+}
 
-	pconnhash["127.0.0.1:6379"] = rproxy.NewPool("127.0.0.1:6379", 10, func(addr string) (*rproxy.Conn, error) {
-		return rproxy.NewConnection(addr, 30)
-	})
-	pconnhash["127.0.0.1:6380"] = rproxy.NewPool("127.0.0.1:6380", 10, func(addr string) (*rproxy.Conn, error) {
-		return rproxy.NewConnection(addr, 30)
-	})
+func getConfServer() []string {
+	mux.Lock()
+	defer mux.Unlock()
+	resp := httplib.Get(*confserver)
+	s, err := resp.String()
+	if err != nil {
+		log.Error(err, "无法获取配置服务器内容")
+		return serverhost
+	}
+	serverhost = strings.Split(s, ",")
+	return serverhost
+}
+
+func initPoolHash() {
+	pmux.Lock()
+	defer pmux.Unlock()
+	h := consistent.New()
+	pch := make(map[string]*rproxy.Pool)
+	sh := getConfServer()
+	h.NumberOfReplicas = len(sh) * 10
+	for _, v := range sh {
+		h.Add(v)
+		pch[v] = rproxy.NewPool(v, 10, func(addr string) (*rproxy.Conn, error) {
+			return rproxy.NewConnection(addr, 30)
+		})
+	}
+	phash = h
+	pconnhash = pch
 }
 
 func handle(conn net.Conn) {
@@ -56,10 +94,11 @@ func handle(conn net.Conn) {
 			continue
 		}
 
-
 		kk := keys[0]
+		pmux.RLock()
 		host, err := phash.Get(string(kk))
 		if err != nil {
+			pmux.RUnlock()
 			log.Error(err)
 			conn.Close()
 			break
@@ -67,6 +106,7 @@ func handle(conn net.Conn) {
 
 		pconn, err := pconnhash[host].GetConn()
 		if err != nil {
+			pmux.RUnlock()
 			log.Error(err)
 			conn.Close()
 			return
@@ -77,23 +117,37 @@ func handle(conn net.Conn) {
 
 		resp, err = rproxy.Parse(pconn.BufioReader())
 		if err != nil && err.Error() == io.EOF.Error() {
+			pmux.RUnlock()
 			log.Error(err)
 			conn.Close()
 			break
 		}
 		if err != nil {
+			pmux.RUnlock()
 			log.Error(err)
 			conn.Close()
 			break
 		}
 		resp.WriteTo(conn)
 		pconnhash[host].PutConn(pconn)
+		pmux.RUnlock()
 	}
 	//log.Error("closed")
 }
 
 func main() {
-	l, err := net.Listen("tcp", "127.0.0.1:3344")
+	go func() {
+		t := time.NewTicker(time.Second * 2)
+		for {
+			select {
+			case <-t.C:
+				initPoolHash()
+				log.Info(serverhost,len(pconnhash))
+			}
+		}
+	}()
+
+	l, err := net.Listen("tcp", *phost + ":" + *pport)
 	if err != nil {
 		log.Fatal(err)
 	}
