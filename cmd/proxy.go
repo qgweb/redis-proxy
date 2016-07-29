@@ -45,10 +45,9 @@ func getConfServer() []string {
 	s, err := resp.String()
 	if err != nil {
 		log.Error(err, "无法获取配置服务器内容")
-		return serverhost
+		return nil
 	}
-	serverhost = strings.Split(s, ",")
-	return serverhost
+	return strings.Split(s, ",")
 }
 
 func initPoolHash() {
@@ -56,7 +55,12 @@ func initPoolHash() {
 	defer pmux.Unlock()
 	h := consistent.New()
 	pch := make(map[string]*rproxy.Pool)
+	ss := serverhost
 	sh := getConfServer()
+	if strings.Join(ss, "") == strings.Join(sh, "") {
+		return
+	}
+	serverhost = sh
 	h.NumberOfReplicas = len(sh) * 10
 	for _, v := range sh {
 		h.Add(v)
@@ -64,6 +68,7 @@ func initPoolHash() {
 			return rproxy.NewConnection(addr, 30)
 		})
 	}
+
 	phash = h
 	pconnhash = pch
 }
@@ -96,6 +101,7 @@ func handle(conn net.Conn) {
 
 		kk := keys[0]
 		pmux.RLock()
+
 		host, err := phash.Get(string(kk))
 		if err != nil {
 			pmux.RUnlock()
@@ -112,28 +118,30 @@ func handle(conn net.Conn) {
 			return
 		}
 
+		pconn.SetWriteDeadline(time.Now().Add(time.Second * 30))
 		resp.WriteTo(pconn)
 		pconn.Flush()
 
 		resp, err = rproxy.Parse(pconn.BufioReader())
 		if err != nil {
+			log.Error(err)
 			pconnhash[host].PutConn(pconn)
 			pmux.RUnlock()
-			log.Error(err)
 			conn.Close()
 			break
 		}
-
+		conn.SetWriteDeadline(time.Now().Add(time.Second*30))
 		resp.WriteTo(conn)
 		pconnhash[host].PutConn(pconn)
 		pmux.RUnlock()
+		//log.Info(111111)
 	}
 	//log.Error("closed")
 }
 
 func main() {
 	go func() {
-		t := time.NewTicker(time.Second * 10)
+		t := time.NewTicker(time.Second * 200)
 		for {
 			select {
 			case <-t.C:
