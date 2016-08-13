@@ -145,12 +145,17 @@ func (this *RConnHandle) Reader() {
 			break
 		}
 
-		if string(op) == "PING" {
+		if strings.ToUpper(string(op)) == "PING" {
 			this.conn.Write([]byte("+PONG\r\n"))
 			continue
 		}
 
-		if (string(op) == "QUIT") {
+		if strings.ToUpper(string(op)) == "INFO" {
+			this.conn.Write([]byte("+OK\r\n"))
+			continue
+		}
+
+		if strings.ToUpper(string(op)) == "QUIT" {
 			this.conn.Close()
 			break
 		}

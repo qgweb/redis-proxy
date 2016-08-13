@@ -5,8 +5,6 @@ import (
 	"github.com/qgweb/redis-proxy"
 	"github.com/ngaut/log"
 	"net"
-	_"net/http/pprof"
-	"net/http"
 )
 
 var (
@@ -40,9 +38,6 @@ func handle(conn net.Conn) {
 }
 
 func main() {
-	go func() {
-	http.ListenAndServe("localhost:6060", nil)
-	}()
 	l, err := net.Listen("tcp", *phost + ":" + *pport)
 	if err != nil {
 		log.Fatal(err)
