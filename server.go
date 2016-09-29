@@ -188,7 +188,6 @@ func (this *RConnHandle) WriteProxy() {
 			log.Info(1)
 			break
 		}
-
 	}
 }
 
