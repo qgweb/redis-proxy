@@ -7,7 +7,14 @@ import (
 	"io"
 	"strconv"
 	"errors"
-	//"time"
+	"stathat.com/c/consistent"
+	"flag"
+	"strings"
+	"syscall"
+	"os/signal"
+	"os"
+	_"net/http/pprof"
+	"net/http"
 )
 
 var (
@@ -409,23 +416,30 @@ type BufConn struct {
 	w    *bufio.Writer
 }
 
-func handler(c *conn) {
-	rconn, err := net.Dial("tcp", ":6379")
-	if err != nil {
-		fmt.Println("FUCK", err)
-		return
-	}
-	defer rconn.Close()
-	tconn := rconn.(*net.TCPConn)
-	tcpc := &BufConn{
-		tconn,
-		bufio.NewReaderSize(tconn, 4096),
-		bufio.NewWriterSize(tconn, 4096),
+func handler(c *conn, servers []string) {
+	cons := consistent.New()
+	cons.Set(servers)
+	cons.NumberOfReplicas = len(servers) * 20
+
+	var redisConns = make(map[string]*BufConn)
+	var newRedisConn = func(addr string) *BufConn {
+		rconn, err := net.Dial("tcp", addr)
+		if err != nil {
+			fmt.Println("FUCK", err)
+			return nil
+		}
+		tconn := rconn.(*net.TCPConn)
+		tcpc := &BufConn{
+			tconn,
+			bufio.NewReaderSize(tconn, 4096),
+			bufio.NewWriterSize(tconn, 4096),
+		}
+		return tcpc
 	}
 
 	var buf = make([]byte, 4096)
 	for {
-		cmds, err := c.rd.readCommands(nil)
+		cmd, err := c.rd.ReadCommand()
 		if err != nil {
 			if err, ok := err.(*errProtocol); ok {
 				c.wr.WriteError("ERR " + err.Error())
@@ -434,13 +448,36 @@ func handler(c *conn) {
 			break
 		}
 
-		for _, v := range cmds {
-			tcpc.w.Write(v.Raw)
+		var hashkey = ""
+		if len(cmd.Args) >= 2 {
+			hashkey = string(cmd.Args[1])
 		}
-		tcpc.w.Flush()
+		if len(cmd.Args) == 1 {
+			hashkey = string(cmd.Args[0])
+		}
+
+		host, err := cons.Get(hashkey)
+		if err != nil {
+			c.wr.WriteError("ERR " + err.Error())
+			c.wr.Flush()
+			continue
+		}
+
+		if _, ok := redisConns[host]; !ok {
+			redisConns[host] = newRedisConn(host)
+			if redisConns[host] == nil {
+				c.wr.WriteError("ERR " + "连接redis实例失败，地址：" + host)
+				c.wr.Flush()
+				delete(redisConns, host)
+				continue
+			}
+		}
+
+		redisConns[host].w.Write(cmd.Raw)
+		redisConns[host].w.Flush()
 
 		for {
-			n, err := tcpc.r.Read(buf)
+			n, err := redisConns[host].r.Read(buf)
 			if err != nil {
 				c.wr.WriteError(err.Error())
 				break
@@ -455,12 +492,53 @@ func handler(c *conn) {
 
 		c.wr.Flush()
 	}
-	tconn.Close()
+
+	for _, v := range redisConns {
+		v.conn.Close()
+	}
 	c.Close()
 }
 
+var (
+	host = flag.String("host", ":8081", "绑定的地址")
+	pprofhost = flag.String("phost", ":8082", "pprof绑定的地址")
+	servers = flag.String("server", ":6379|:6380", "redis实例地址，按|隔开")
+	_ = flag.String("help", "", `
+	如需重新初始化redis实例地址
+	使用 export REDISHOSTS = :6379|:6380
+	kill -HUP server进程号`)
+	exitChan = make(chan os.Signal, 1)
+)
+
+func init() {
+	flag.Parse()
+}
 func main() {
-	n, err := net.Listen("tcp", ":8081")
+	go func() {
+		signal.Notify(exitChan, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT) // , syscall.SIGSTOP
+		for {
+			s := <-exitChan
+			switch s {
+			case syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT: // , syscall.SIGSTOP
+				os.Exit(0)
+				return
+			case syscall.SIGHUP:
+				fmt.Println(111)
+				if s := os.Getenv("REDISHOSTS"); s != "" {
+					fmt.Println(s)
+					*servers = s
+				}
+			default:
+				return
+			}
+		}
+	}()
+
+	go func() {
+		http.ListenAndServe(*pprofhost, nil)
+	}()
+
+	n, err := net.Listen("tcp", *host)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -473,6 +551,6 @@ func main() {
 		}
 		c := &conn{conn: tcpc, addr: tcpc.RemoteAddr().String(),
 			wr: NewWriter(tcpc), rd: NewReader(tcpc)}
-		go handler(c)
+		go handler(c, strings.Split(*servers, "|"))
 	}
 }
